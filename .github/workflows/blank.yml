@@ -1,0 +1,205 @@
+!pip install aiogram==2.25.1
+
+import asyncio
+from aiogram import Bot, Dispatcher, types
+import requests
+import hashlib
+import hmac
+import time
+import nest_asyncio
+
+# Применение nest_asyncio для совместимости с Jupyter Notebook
+nest_asyncio.apply()
+
+# Инициализация бота
+TELEGRAM_API_TOKEN = '7602248258:AAGoUr4x3RGrynW8PphjNMb1a5oBhiEX6k8'  # Замените на ваш токен
+bot = Bot(token=TELEGRAM_API_TOKEN)
+dp = Dispatcher(bot)
+
+# Пример кнопок
+keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+buttons = ["Статистика стакана", "Жадность на рынке", "Лонг/Шорт", "Цена BTC/USDT", "Цена ETH/USDT"]
+keyboard.add(*buttons)
+
+# Виртуальное хранилище для ключей пользователей и символов
+user_api_data = {}
+user_symbol = {}
+
+# Конфигурация API Bybit
+BYBIT_BASE_URL = 'https://api.bybit.com'
+
+# Функция для создания подписи запроса
+def generate_signature(secret, params):
+    query_string = '&'.join([f"{key}={value}" for key, value in sorted(params.items())])
+    return hmac.new(secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
+
+# Функция для выполнения приватных запросов к Bybit
+def private_request(user_id, endpoint, params=None):
+    if params is None:
+        params = {}
+    params['api_key'] = user_api_data[user_id]['api_key']
+    params['timestamp'] = str(int(time.time() * 1000))
+    params['sign'] = generate_signature(user_api_data[user_id]['api_secret'], params)
+    response = requests.get(f"{BYBIT_BASE_URL}{endpoint}", params=params)
+    return response.json()
+
+# Публичный запрос к стакану ордеров
+def get_order_book(symbol='BTCUSDT'):
+    response = requests.get(f"{BYBIT_BASE_URL}/v2/public/orderBook/L2", params={'symbol': symbol})
+    return response.json()
+
+# Публичный запрос на объем открытых позиций (лонг/шорт)
+def get_open_interest(symbol='BTCUSDT'):
+    response = requests.get(f"{BYBIT_BASE_URL}/v2/public/open-interest", params={'symbol': symbol, 'period': '1h'})
+    return response.json()
+
+# Приватный запрос для получения баланса аккаунта
+def get_account_balance(user_id):
+    endpoint = "/v2/private/wallet/balance"
+    response = private_request(user_id, endpoint)
+    return response
+
+# Приватный запрос для получения данных по позициям
+def get_position_details(symbol):
+    endpoint = "/v2/private/position/list"
+    params = {'symbol': symbol}
+    response = private_request(user_id, endpoint, params)
+    return response.json()
+
+# Публичный запрос на получение текущей цены BTC/USDT и ETH/USDT
+def get_price(symbol='BTCUSDT'):
+    response = requests.get(f"{BYBIT_BASE_URL}/v2/public/tickers", params={'symbol': symbol})
+    return response.json()
+
+# Хэндлер для команды /start
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    await message.answer("Привет! Я бот для анализа рынка на Bybit. Введите ваш API-ключ и секрет от Bybit в формате:\n\n/api {API_KEY} {API_SECRET}")
+
+# Хэндлер для ввода API-ключа
+@dp.message_handler(lambda message: message.text.startswith("/api"))
+async def set_api_keys(message: types.Message):
+    try:
+        _, api_key, api_secret = message.text.split()
+        user_api_data[message.from_user.id] = {
+            'api_key': api_key,
+            'api_secret': api_secret
+        }
+        await message.answer("API-ключи успешно сохранены! Выберите опцию для анализа:", reply_markup=keyboard)
+    except ValueError:
+        await message.answer("Неверный формат команды. Введите API-ключ и секрет в формате:\n\n/api {API_KEY} {API_SECRET}")
+
+# Хэндлер для кнопки "Статистика стакана"
+@dp.message_handler(lambda message: message.text == "Статистика стакана")
+async def order_book_stats(message: types.Message):
+    data = get_order_book()
+    if 'result' in data:
+        bids = data['result'][:5]  # Топ 5 покупок
+        asks = data['result'][-5:]  # Топ 5 продаж
+        bids_str = "\n".join([f"Цена: {item['price']}, Объем: {item['size']}" for item in bids])
+        asks_str = "\n".join([f"Цена: {item['price']}, Объем: {item['size']}" for item in asks])
+        await message.answer(f"Первые 5 уровней стакана:\nПокупки:\n{bids_str}\n\nПродажи:\n{asks_str}")
+    else:
+        await message.answer("Не удалось получить данные по стакану.")
+
+# Хэндлер для кнопки "Лонг/Шорт" — запрашивает у пользователя торговую пару
+@dp.message_handler(lambda message: message.text == "Лонг/Шорт")
+async def ask_for_symbol(message: types.Message):
+    await message.answer("Введите торговую пару, например, BTCUSDT или ETHUSDT")
+
+# Хэндлер для обработки введённой торговой пары и получения данных по лонг/шорт
+@dp.message_handler(lambda message: message.text.isupper() and message.text in ["BTCUSDT", "ETHUSDT"])
+async def long_short_with_symbol(message: types.Message):
+    user_symbol[message.from_user.id] = message.text.upper()  # Сохраняем символ в верхнем регистре
+
+    # Проверяем, введена ли торговая пара
+    if message.from_user.id in user_api_data:
+        symbol = user_symbol[message.from_user.id]
+
+        # Получаем данные по введенной паре
+        data = get_open_interest(symbol)  # Данные по общему объему
+        positions_data = get_position_details(symbol)  # Данные по контрактам лонг/шорт
+
+        if 'result' in data and 'result' in positions_data:
+            open_interest = data['result']['open_interest']
+
+            # Парсинг данных по лонгам и шортам
+            long_positions = [pos for pos in positions_data['result'] if pos['side'] == 'Buy']
+            short_positions = [pos for pos in positions_data['result'] if pos['side'] == 'Sell']
+
+            long_value = sum([float(pos['size']) * float(pos['entry_price']) for pos in long_positions])  # Стоимость лонгов
+            short_value = sum([float(pos['size']) * float(pos['entry_price']) for pos in short_positions])  # Стоимость шортов
+
+            long_size = sum([float(pos['size']) for pos in long_positions])  # Общее количество лонгов
+            short_size = sum([float(pos['size']) for pos in short_positions])  # Общее количество шортов
+
+            # Формирование сообщения
+            message_text = (
+                f"Торговая пара: {symbol}\n\n"
+                f"Общий объём открытых позиций (лонг/шорт): {open_interest}\n\n"
+                f"Лонги:\n"
+                f"Количество контрактов: {long_size}\n"
+                f"Стоимость позиций в долларах: ${long_value}\n\n"
+                f"Шорты:\n"
+                f"Количество контрактов: {short_size}\n"
+                f"Стоимость позиций в долларах: ${short_value}"
+            )
+
+            await message.answer(message_text)
+        else:
+            await message.answer("Не удалось получить данные по открытым позициям.")
+    else:
+        await message.answer("Пожалуйста, сначала введите свои API-ключи.")
+
+# Хэндлер для кнопки "Жадность на рынке"
+@dp.message_handler(lambda message: message.text == "Жадность на рынке")
+async def market_greed_index(message: types.Message):
+    # Данные индекса жадности можно взять из стороннего источника, так как Bybit не предоставляет его напрямую.
+        # Данные индекса жадности можно взять из стороннего источника, так как Bybit не предоставляет его напрямую.
+    response = requests.get('https://api.alternative.me/fng/?limit=1')
+    data = response.json()
+    index_value = data['data'][0]['value']
+    await message.answer(f"Текущий индекс жадности и страха: {index_value}")
+
+# Хэндлер для кнопки "Цена BTC/USDT"
+@dp.message_handler(lambda message: message.text == "Цена BTC/USDT")
+async def btc_price(message: types.Message):
+    price_data = get_price('BTCUSDT')
+    if 'result' in price_data:
+        price = price_data['result'][0]['last_price']
+        await message.answer(f"Текущая цена BTC/USDT: ${price}")
+    else:
+        await message.answer("Не удалось получить данные о цене BTC/USDT.")
+
+# Хэндлер для кнопки "Цена ETH/USDT"
+@dp.message_handler(lambda message: message.text == "Цена ETH/USDT")
+async def eth_price(message: types.Message):
+    price_data = get_price('ETHUSDT')
+    if 'result' in price_data:
+        price = price_data['result'][0]['last_price']
+        await message.answer(f"Текущая цена ETH/USDT: ${price}")
+    else:
+        await message.answer("Не удалось получить данные о цене ETH/USDT.")
+
+# Хэндлер для кнопки "Баланс аккаунта"
+@dp.message_handler(lambda message: message.text == "Баланс аккаунта")
+async def account_balance(message: types.Message):
+    if message.from_user.id in user_api_data:
+        balance_data = get_account_balance(message.from_user.id)
+        if 'result' in balance_data:
+            balances = balance_data['result']
+            balance_str = "\n".join([f"{coin}: {data['available_balance']}" for coin, data in balances.items()])
+            await message.answer(f"Ваш баланс на Bybit:\n{balance_str}")
+        else:
+            await message.answer("Не удалось получить данные по балансу.")
+    else:
+        await message.answer("Пожалуйста, сначала введите свои API-ключи.")
+
+# Функция для запуска бота
+async def on_startup(dp):
+    print("Бот запущен!")
+
+if __name__ == "__main__":
+    from aiogram import executor
+    executor.start_polling(dp, on_startup=on_startup)
+
